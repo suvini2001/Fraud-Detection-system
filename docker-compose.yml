@@ -1,8 +1,55 @@
+version: '3.8'
+
 services:
-  fraud-api:
+  zookeeper:
+    image: confluentinc/cp-zookeeper:7.4.0
+    container_name: zookeeper
+    environment:
+      ZOOKEEPER_CLIENT_PORT: 2181
+      ZOOKEEPER_TICK_TIME: 2000
+    ports:
+      - "2181:2181"
+
+  kafka:
+    image: confluentinc/cp-kafka:7.4.0
+    container_name: kafka
+    depends_on:
+      - zookeeper
+    ports:
+      - "9092:9092"
+    environment:
+      KAFKA_BROKER_ID: 1
+      KAFKA_ZOOKEEPER_CONNECT: zookeeper:2181
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:9092
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+
+  fastapi:
     build:
       context: .
       dockerfile: Dockerfile.api
-    container_name: fraud-api-container
+    container_name: fraud_fastapi
     ports:
       - "8000:8000"
+    depends_on:
+      - kafka
+
+  producer:
+    build:
+      context: .
+      dockerfile: Dockerfile.producer
+    container_name: fraud_producer
+    depends_on:
+      - kafka
+    restart: on-failure
+
+  consumer:
+    build:
+      context: .
+      dockerfile: Dockerfile.consumer
+    container_name: fraud_consumer
+    depends_on:
+      - kafka
+    restart: on-failure
+
+#This file coordinates the distributed system. It starts Zookeeper and Kafka first,
+# waits for the broker to initialize, and then launches the API, producer, and consumer.
