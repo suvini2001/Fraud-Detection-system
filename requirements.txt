@@ -1,0 +1,7 @@
+fastapi
+uvicorn
+pydantic
+joblib
+pandas
+numpy
+xgboost==2.1.4

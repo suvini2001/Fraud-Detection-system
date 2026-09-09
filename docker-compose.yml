@@ -1,0 +1,8 @@
+services:
+  fraud-api:
+    build:
+      context: .
+      dockerfile: Dockerfile.api
+    container_name: fraud-api-container
+    ports:
+      - "8000:8000"

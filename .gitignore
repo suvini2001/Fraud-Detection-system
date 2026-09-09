@@ -1,0 +1,169 @@
+# ============================================================
+#  .gitignore — Fraud Detection API (FastAPI + XGBoost)
+# ============================================================
+
+
+# ------------------------------------------------------------
+# Python Virtual Environments
+# ------------------------------------------------------------
+.venv/
+venv/
+env/
+ENV/
+.env/
+
+
+# ------------------------------------------------------------
+# Python Cache & Bytecode
+# ------------------------------------------------------------
+__pycache__/
+*.py[cod]
+*$py.class
+*.pyo
+*.pyd
+
+
+# ------------------------------------------------------------
+# ML Model Artifacts  <- large binary files; use Git LFS or
+#                       store in a model registry instead
+# ------------------------------------------------------------
+app/model/*.pkl
+app/model/*.joblib
+app/model/*.bin
+app/model/*.h5
+app/model/*.pt
+app/model/*.onnx
+# Uncomment the line below if you want to track model files:
+# !app/model/fraud_xgb_model.pkl
+
+
+# ------------------------------------------------------------
+# Jupyter Notebooks Checkpoints
+# ------------------------------------------------------------
+.ipynb_checkpoints/
+*.ipynb
+
+
+# ------------------------------------------------------------
+# Environment & Secrets
+# ------------------------------------------------------------
+.env
+.env.*
+*.env
+secrets.yaml
+secrets.json
+config/secrets/
+
+
+# ------------------------------------------------------------
+# Distribution / Packaging
+# ------------------------------------------------------------
+dist/
+build/
+*.egg-info/
+*.egg
+MANIFEST
+site/
+
+
+# ------------------------------------------------------------
+# Testing & Coverage
+# ------------------------------------------------------------
+.pytest_cache/
+.coverage
+.coverage.*
+htmlcov/
+coverage.xml
+*.xml
+
+
+# ------------------------------------------------------------
+# Linting & Type Checking
+# ------------------------------------------------------------
+.mypy_cache/
+.ruff_cache/
+.pylint.d/
+
+
+# ------------------------------------------------------------
+# Docker
+# ------------------------------------------------------------
+# Keep Dockerfile.api, docker-compose.yml, and .dockerignore
+# but ignore generated/runtime Docker files
+*.dockerenv
+docker-compose.override.yml
+
+
+# ------------------------------------------------------------
+# OS Generated Files
+# ------------------------------------------------------------
+# Windows
+Thumbs.db
+ehthumbs.db
+Desktop.ini
+$RECYCLE.BIN/
+
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+
+# Linux
+*~
+
+
+# ------------------------------------------------------------
+# IDE & Editors
+# ------------------------------------------------------------
+# VSCode
+.vscode/
+*.code-workspace
+
+# PyCharm / JetBrains
+.idea/
+*.iml
+
+# Jupyter
+.jupyter/
+
+# Vim / Emacs
+*.swp
+*.swo
+*~
+
+
+# ------------------------------------------------------------
+# Logs & Temporary Files
+# ------------------------------------------------------------
+*.log
+logs/
+tmp/
+temp/
+*.tmp
+
+
+# ------------------------------------------------------------
+# Data Files  <- raw datasets should NOT be committed
+# ------------------------------------------------------------
+data/raw/
+data/processed/
+*.csv
+*.parquet
+*.feather
+*.h5
+*.hdf5
+# Uncomment below to allow small sample/test data:
+# !data/sample_data.csv
+
+
+# ------------------------------------------------------------
+# Miscellaneous
+# ------------------------------------------------------------
+*.bak
+*.orig
+.cache/
+
+# ------------------------------------------------------------
+# Nested / Cloned Repositories (not submodules)
+# ------------------------------------------------------------
+Fraud-Detection system/
