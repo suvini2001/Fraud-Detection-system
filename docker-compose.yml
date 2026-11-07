@@ -1,55 +1,151 @@
-version: '3.8'
+# =====================================================================
+#  Real-time Fraud Detection - Kafka architecture
+#
+#  3-node Kafka cluster in KRaft mode (no ZooKeeper). Every node is both
+#  a broker (stores data) and a controller (Raft quorum for metadata).
+#
+#    producer ─┐                         ┌─► scorer x3 (group fraud-scorer) ─┬─► transactions.scored
+#    api ──────┴─► transactions.raw ─────┘                                   ├─► fraud.alerts ──► alerts (group fraud-alert-notifier)
+#                  (6 partitions, RF=3)                                      └─► transactions.dlq
+#
+#  Run:   docker compose up -d --build
+#  UI:    http://localhost:8080  (Kafka UI)     API: http://localhost:8000/docs
+# =====================================================================
+
+x-kafka-common: &kafka-common
+  image: confluentinc/cp-kafka:7.6.1
+  restart: unless-stopped
+  healthcheck:
+    test: [ "CMD-SHELL", "kafka-broker-api-versions --bootstrap-server localhost:29092 > /dev/null 2>&1" ]
+    interval: 10s
+    timeout: 10s
+    retries: 12
+    start_period: 20s
+
+x-kafka-env:
+  # Same id on every node = one cluster. (Generate your own with: kafka-storage random-uuid)
+  &kafka-env
+  CLUSTER_ID: "q1Sh-9_ISia_zwGINzRvyQ"
+  KAFKA_PROCESS_ROLES: "broker,controller"
+  KAFKA_CONTROLLER_QUORUM_VOTERS: "1@kafka-1:29093,2@kafka-2:29093,3@kafka-3:29093"
+  KAFKA_CONTROLLER_LISTENER_NAMES: "CONTROLLER"
+  KAFKA_INTER_BROKER_LISTENER_NAME: "INTERNAL"
+  KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: "CONTROLLER:PLAINTEXT,INTERNAL:PLAINTEXT,EXTERNAL:PLAINTEXT"
+  # ---- Replication / durability defaults ----
+  KAFKA_DEFAULT_REPLICATION_FACTOR: 3
+  KAFKA_MIN_INSYNC_REPLICAS: 2
+  KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 3 # __consumer_offsets
+  KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 3 # __transaction_state
+  KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 2
+  KAFKA_UNCLEAN_LEADER_ELECTION_ENABLE: "false" # never elect an out-of-sync replica (no data loss)
+  # Topics are created explicitly by kafka-init (no accidental 1-partition topics)
+  KAFKA_AUTO_CREATE_TOPICS_ENABLE: "false"
+  KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: 3000
+  KAFKA_LOG_DIRS: "/var/lib/kafka/data"
 
 services:
-  zookeeper:
-    image: confluentinc/cp-zookeeper:7.4.0
-    container_name: zookeeper
+  kafka-1:
+    <<: *kafka-common
+    container_name: kafka-1
+    hostname: kafka-1
+    ports: [ "9092:9092" ]
     environment:
-      ZOOKEEPER_CLIENT_PORT: 2181
-      ZOOKEEPER_TICK_TIME: 2000
-    ports:
-      - "2181:2181"
+      <<: *kafka-env
+      KAFKA_NODE_ID: 1
+      KAFKA_LISTENERS: "INTERNAL://0.0.0.0:29092,CONTROLLER://0.0.0.0:29093,EXTERNAL://0.0.0.0:9092"
+      KAFKA_ADVERTISED_LISTENERS: "INTERNAL://kafka-1:29092,EXTERNAL://localhost:9092"
+    volumes: [ "kafka1-data:/var/lib/kafka/data" ]
 
-  kafka:
-    image: confluentinc/cp-kafka:7.4.0
-    container_name: kafka
-    depends_on:
-      - zookeeper
-    ports:
-      - "9092:9092"
+  kafka-2:
+    <<: *kafka-common
+    container_name: kafka-2
+    hostname: kafka-2
+    ports: [ "9094:9094" ]
     environment:
-      KAFKA_BROKER_ID: 1
-      KAFKA_ZOOKEEPER_CONNECT: zookeeper:2181
-      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:9092
-      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      <<: *kafka-env
+      KAFKA_NODE_ID: 2
+      KAFKA_LISTENERS: "INTERNAL://0.0.0.0:29092,CONTROLLER://0.0.0.0:29093,EXTERNAL://0.0.0.0:9094"
+      KAFKA_ADVERTISED_LISTENERS: "INTERNAL://kafka-2:29092,EXTERNAL://localhost:9094"
+    volumes: [ "kafka2-data:/var/lib/kafka/data" ]
 
-  fastapi:
-    build:
-      context: .
-      dockerfile: Dockerfile.api
-    container_name: fraud_fastapi
-    ports:
-      - "8000:8000"
+  kafka-3:
+    <<: *kafka-common
+    container_name: kafka-3
+    hostname: kafka-3
+    ports: [ "9096:9096" ]
+    environment:
+      <<: *kafka-env
+      KAFKA_NODE_ID: 3
+      KAFKA_LISTENERS: "INTERNAL://0.0.0.0:29092,CONTROLLER://0.0.0.0:29093,EXTERNAL://0.0.0.0:9096"
+      KAFKA_ADVERTISED_LISTENERS: "INTERNAL://kafka-3:29092,EXTERNAL://localhost:9096"
+    volumes: [ "kafka3-data:/var/lib/kafka/data" ]
+
+  # One-shot job: creates topics with partitions, replication and configs
+  kafka-init:
+    image: confluentinc/cp-kafka:7.6.1
+    container_name: kafka-init
     depends_on:
-      - kafka
+      kafka-1: { condition: service_healthy }
+      kafka-2: { condition: service_healthy }
+      kafka-3: { condition: service_healthy }
+    volumes: [ "./scripts/create_topics.sh:/create_topics.sh:ro" ]
+    entrypoint: [ "bash", "/create_topics.sh" ]
+    environment:
+      BOOTSTRAP: "kafka-1:29092,kafka-2:29092,kafka-3:29092"
+    restart: "no"
+
+  kafka-ui:
+    image: provectuslabs/kafka-ui:v0.7.2
+    container_name: kafka-ui
+    ports: [ "8080:8080" ]
+    depends_on:
+      kafka-init: { condition: service_completed_successfully }
+    environment:
+      KAFKA_CLUSTERS_0_NAME: fraud-cluster
+      KAFKA_CLUSTERS_0_BOOTSTRAPSERVERS: "kafka-1:29092,kafka-2:29092,kafka-3:29092"
+
+  api:
+    build: .
+    image: fraud-detection-app:latest
+    container_name: fraud-api
+    command: [ "uvicorn", "app.api:app", "--host", "0.0.0.0", "--port", "8000" ]
+    ports: [ "8000:8000" ]
+    depends_on:
+      kafka-init: { condition: service_completed_successfully }
+    restart: unless-stopped
 
   producer:
-    build:
-      context: .
-      dockerfile: Dockerfile.producer
-    container_name: fraud_producer
+    image: fraud-detection-app:latest # same image built by "api"
+    pull_policy: never
+    command: [ "python", "-u", "-m", "app.producer" ]
     depends_on:
-      - kafka
-    restart: on-failure
+      kafka-init: { condition: service_completed_successfully }
+    restart: unless-stopped
 
-  consumer:
-    build:
-      context: .
-      dockerfile: Dockerfile.consumer
-    container_name: fraud_consumer
+  # Horizontal scaling: 3 replicas in ONE consumer group share 6 partitions
+  # (2 each). Change at runtime:  docker compose up -d --scale scorer=6
+  scorer:
+    image: fraud-detection-app:latest # same image built by "api"
+    pull_policy: never
+    command: [ "python", "-u", "-m", "app.consumer" ]
     depends_on:
-      - kafka
-    restart: on-failure
+      kafka-init: { condition: service_completed_successfully }
+    deploy:
+      replicas: 3
+    stop_grace_period: 30s
+    restart: unless-stopped
 
-#This file coordinates the distributed system. It starts Zookeeper and Kafka first,
-# waits for the broker to initialize, and then launches the API, producer, and consumer.
+  alerts:
+    image: fraud-detection-app:latest # same image built by "api"
+    pull_policy: never
+    container_name: fraud-alerts
+    command: [ "python", "-u", "-m", "app.alert_consumer" ]
+    volumes: [ "./data:/data" ]
+    depends_on:
+      kafka-init: { condition: service_completed_successfully }
+    restart: unless-stopped
+
+volumes:
+  kafka1-data:
+  kafka2-data:
+  kafka3-data:

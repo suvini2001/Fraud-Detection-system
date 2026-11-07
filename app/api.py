@@ -1,166 +1,139 @@
-from fastapi import FastAPI
-import joblib
-from pydantic import BaseModel
-import pandas as pd
-import numpy as np
-from pathlib import Path
-
-
-# - initilaize the app and load artifacts to memory
-app=FastAPI( title="Fraud Detection API")
-
-# load the models generated from  my colab notebook
-
-# Resolve the path problem 
-
-BASE_DIR = Path(__file__).resolve().parent
-MODEL_DIR = BASE_DIR / "model"
-
-model=joblib.load(MODEL_DIR/"fraud_xgb_model.pkl")
-feature_columns=joblib.load(MODEL_DIR/"model_features.pkl")
-frequency_maps=joblib.load(MODEL_DIR/"frequency_maps.pkl")
-
-
-
-#Step 3: Create the Data Validation Schema (BaseModel)
-
 """
-This is where Pydantic comes in.
-creating a validation schema using Pydantic. This acts as a strict bouncer for your API. 
-It ensures that any incoming request contains exactly the right fields with the correct data types 
-before the model tries to process it. If a request is missing an amount or sends text instead of a number,
-the API automatically rejects it with an error.
+FastAPI service.
 
+* POST /predict          -> synchronous scoring (same as before, now shares
+                            the fixed feature code with the stream scorer)
+* POST /v1/transactions  -> INGESTION GATEWAY: validates the transaction and
+                            publishes it to Kafka (key = nameOrig, acks=all).
+                            Returns 202 + the partition/offset it was written to.
+* GET  /health           -> liveness + Kafka connectivity
 """
 
-class Transaction(BaseModel):
-    step: int
-    type: str
-    amount: float
-    oldbalanceOrg: float
-    newbalanceOrig: float
-    oldbalanceDest: float
-    newbalanceDest: float
-    nameOrig: str
-    nameDest: str
+import threading
+import uuid
+from contextlib import asynccontextmanager
+from typing import Optional
+
+from fastapi import FastAPI, HTTPException
+from pydantic import BaseModel, Field
+
+from app.common.config import MODEL_DIR, KafkaSettings, ScorerSettings
+from app.common.logging_setup import setup_logging
+from app.common.model import FraudScorer
+from app.common.schemas import TransactionEvent, TxType
+from app.common.serde import build_headers, serialize_key, serialize_value
+
+log = setup_logging("api")
+
+kafka = KafkaSettings()
+state = {}
 
 
-#Step 4: Define the Prediction Route
+class TransactionIn(BaseModel):
+    """Public request body (transaction_id is optional: generated if missing)."""
+    transaction_id: Optional[str] = None
+    step: int = Field(ge=0, le=719)
+    type: TxType
+    amount: float = Field(ge=0)
+    nameOrig: str = Field(pattern=r"^C\d+$")
+    oldbalanceOrg: float = Field(ge=0)
+    newbalanceOrig: float = Field(ge=0)
+    nameDest: str = Field(pattern=r"^[CM]\d+$")
+    oldbalanceDest: float = Field(ge=0)
+    newbalanceDest: float = Field(ge=0)
 
-"""
-create an endpoint (e.g., /predict) that accepts HTTP POST requests containing the Transaction data.
+    def to_event(self) -> TransactionEvent:
+        data = self.model_dump()
+        data["transaction_id"] = data["transaction_id"] or str(uuid.uuid4())
+        return TransactionEvent(**data)
 
-Inside this function, you must write the logic that takes the raw incoming data, applies the exact same feature engineering you did during 
-training (calculating balance differences, mapping frequency dictionaries, flagging merchants), and then runs model.predict().
 
-"""
+def _poll_loop(producer, stop: threading.Event):
+    # Delivery callbacks run inside poll(); keep serving them in background
+    while not stop.is_set():
+        producer.poll(0.1)
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    settings = ScorerSettings()
+    state["scorer"] = FraudScorer(MODEL_DIR, settings.fraud_threshold)
+    try:
+        from app.common.kafka_clients import make_producer
+        producer = make_producer(kafka)
+        stop = threading.Event()
+        thread = threading.Thread(target=_poll_loop, args=(producer, stop), daemon=True)
+        thread.start()
+        state.update(producer=producer, stop=stop)
+        log.info("Kafka producer ready (%s)", kafka.bootstrap_servers)
+    except Exception as exc:  # API still serves /predict without Kafka
+        log.error("Kafka producer not available: %s", exc)
+    yield
+    if "producer" in state:
+        state["stop"].set()
+        state["producer"].flush(10)
+
+
+app = FastAPI(title="Fraud Detection API", version="2.0", lifespan=lifespan)
 
 
 @app.post("/predict")
-def predict_fraud(transaction: Transaction):
-
-    # Convert Pydantic object to dictionary
-    data = transaction.model_dump()
-
-    # --------------------------------------------------
-    # 1. RECREATE FEATURES CREATED DURING TRAINING
-    # --------------------------------------------------
-
-    # Log transformation of transaction amount
-    data["amount_log"] = np.log1p(data["amount"])
-
-    # Origin account balance difference
-    data["balanceDiffOrig"] = (
-        data["oldbalanceOrg"] - data["newbalanceOrig"]
-    )
-
-    # Destination account balance difference
-    data["balanceDiffDest"] = (
-        data["newbalanceDest"] - data["oldbalanceDest"]
-    )
-
-    # Extract hour from step
-    data["hour_of_day"] = data["step"] % 24
-
-    # Extract day from step
-    data["day_of_month"] = data["step"] // 24
+def predict(tx: TransactionIn):
+    event = tx.to_event()
+    prob, is_fraud = state["scorer"].score(event)
+    return {"transaction_id": event.transaction_id,
+            "fraud_probability": round(prob, 6), "is_fraud": int(is_fraud)}
 
 
-    # --------------------------------------------------
-    # 2. APPLY TRAINING-ONLY FREQUENCY MAPS
-    # --------------------------------------------------
+@app.post("/v1/transactions", status_code=202)
+def ingest(tx: TransactionIn):
+    producer = state.get("producer")
+    if producer is None:
+        raise HTTPException(503, "Kafka producer unavailable")
+    event = tx.to_event()
 
-    data["sender_freqency"] = (
-        frequency_maps["sender_counts"]
-        .get(data["nameOrig"], 0)
-    )
+    done = threading.Event()
+    result = {}
 
-    data["receiver_freqency"] = (
-        frequency_maps["receiver_counts"]
-        .get(data["nameDest"], 0)
-    )
+    def on_delivery(err, msg):
+        result["err"] = err
+        if err is None:
+            result.update(partition=msg.partition(), offset=msg.offset())
+        done.set()
 
+    try:
+        producer.produce(
+            kafka.topics.raw,
+            key=serialize_key(event.nameOrig),
+            value=serialize_value(event),
+            headers=build_headers("fraud-api", {"trace-id": event.transaction_id}),
+            on_delivery=on_delivery,
+        )
+    except BufferError:
+        raise HTTPException(503, "Producer queue full, retry later")
 
-    # --------------------------------------------------
-    # 3. MERCHANT DESTINATION FEATURE
-    # --------------------------------------------------
+    # Wait for acks=all from the in-sync replicas (bounded)
+    if not done.wait(10):
+        raise HTTPException(504, "Timed out waiting for Kafka acknowledgement")
+    if result.get("err") is not None:
+        raise HTTPException(502, f"Kafka delivery failed: {result['err']}")
 
-    data["is_merchant_dest"] = (
-        1 if str(data["nameDest"]).startswith("M") else 0
-    )
-
-
-    # --------------------------------------------------
-    # 4. REMOVE RAW CATEGORICAL ACCOUNT IDs
-    # --------------------------------------------------
-
-    del data["nameOrig"]
-    del data["nameDest"]
-
-    # step was used to create time features
-    # and was dropped during training
-    del data["step"]
-
-
-    # --------------------------------------------------
-    # 5. CONVERT TO DATAFRAME
-    # --------------------------------------------------
-
-    df = pd.DataFrame([data])
+    return {"status": "accepted", "transaction_id": event.transaction_id,
+            "topic": kafka.topics.raw, "key": event.nameOrig,
+            "partition": result["partition"], "offset": result["offset"]}
 
 
-    # --------------------------------------------------
-    # 6. ONE-HOT ENCODE TRANSACTION TYPE
-    # --------------------------------------------------
-
-    df = pd.get_dummies(
-        df,
-        columns=["type"],
-        drop_first=True
-    )
-
-
-    # --------------------------------------------------
-    # 7. MATCH EXACT TRAINING FEATURES
-    # --------------------------------------------------
-
-    df = df.reindex(
-        columns=feature_columns,
-        fill_value=0
-    )
-
-
-    # --------------------------------------------------
-    # 8. MAKE PREDICTION
-    # --------------------------------------------------
-
-    prediction = model.predict(df)[0]
-
-
-    # --------------------------------------------------
-    # 9. RETURN JSON RESPONSE
-    # --------------------------------------------------
-
-    return {
-        "is_fraud": int(prediction)
-    }
+@app.get("/health")
+def health():
+    producer = state.get("producer")
+    kafka_ok = False
+    brokers = 0
+    if producer is not None:
+        try:
+            md = producer.list_topics(timeout=3)
+            brokers = len(md.brokers)
+            kafka_ok = kafka.topics.raw in md.topics
+        except Exception:
+            pass
+    return {"status": "ok", "model_loaded": "scorer" in state,
+            "kafka_ok": kafka_ok, "brokers": brokers}
