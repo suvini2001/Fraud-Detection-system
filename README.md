@@ -284,61 +284,6 @@ pytest
 
 Kafka is replaced with fakes (`tests/fakes.py`) for the service tests, so no broker is needed. One test that loads the real model is skipped if the model files are missing.
 
----
-
-## Debugging notes
-
-All unit tests passed, but the first full Docker run exposed three startup problems that fakes could not catch. Each fix has a regression test.
-
-| Symptom | Root cause | Fix |
-| --- | --- | --- |
-| Scorers crash-looped; `fraud-scorer` group never appeared and `transactions.scored` stayed empty | librdkafka requires `delivery.timeout.ms` (`message.timeout.ms`) ≤ `transaction.timeout.ms`; the shared producer config had 120 s vs 60 s, so the **transactional** producer refused to start. The API and producer are not transactional, so they worked | Transactional producers use a 60 s delivery timeout. `tests/test_kafka_config.py` now builds real clients from the configs |
-| `init_transactions()` timed out on the first run (`_TIMED_OUT`, then `NOT_COORDINATOR`) | The first transactional producer on a new cluster triggers creation of `__transaction_state` (50 partitions x RF 3); on a busy laptop that outlasted a single 30 s call, and librdkafka reports it as retriable | Retry `init_transactions()` (up to 10 x 60 s) on retriable errors; fatal errors such as fencing still crash |
-| `kafka-init` failed with `TimeoutException ... node 1 being disconnected` | A broker was slow to answer while all app containers were starting at once | `create_topics.sh` retries each topic up to 5 times (safe with `--if-not-exists`) |
-
-Environment lessons:
-- Running another local Kubernetes cluster (k3d) at the same time starved the brokers of memory, so they never became healthy. Stop other heavy stacks first.
-- On Windows, shell scripts checked out with CRLF line endings fail inside Linux containers; `.gitattributes` forces `*.sh` to LF.
-
----
-
-## Project structure
-
-```
-app/
-├── api.py               # FastAPI: /predict, /v1/transactions, /health
-├── producer.py          # simulated payment gateway
-├── consumer.py          # scoring consumer group (exactly-once, DLQ)
-├── alert_consumer.py    # alert notifier (idempotent, at-least-once)
-└── common/
-    ├── config.py        # environment-based settings
-    ├── features.py      # feature engineering shared by API and scorer
-    ├── kafka_clients.py # producer/consumer configuration
-    ├── model.py         # XGBoost model loading and scoring
-    ├── schemas.py       # versioned Pydantic message contracts
-    ├── serde.py         # serialization and Kafka headers
-    └── logging_setup.py
-scripts/
-├── create_topics.sh     # topic creation (partitions, RF, retention, retries)
-└── demo.sh              # step-by-step feature demo
-tests/                   # unit tests (Kafka fakes + real client config checks)
-docs/images/             # screenshots from the verified run
-docker-compose.yml       # 3-broker KRaft cluster + Kafka UI + app services
-Dockerfile               # one non-root image for all services
-```
-
----
-
-## Roadmap
-
-Planned extensions, not yet implemented:
-
-- [ ] **Online feature store.** Feast with Redis for streaming per-account velocity features (for example, transaction count and amount over the last hour).
-- [ ] **Model registry.** MLflow for versioned models, replacing the git-ignored `.pkl` files, and re-saving the model in XGBoost's native JSON format (the current pickle triggers a version-compatibility warning).
-- [ ] **Kubernetes deployment.** Run Kafka with the Strimzi operator and the services as Deployments, with stable consumer identities for static membership.
-- [ ] **Monitoring.** Prometheus and Grafana for throughput, consumer lag and latency, and Evidently for data and prediction drift.
-
----
 
 ## Tech stack
 
