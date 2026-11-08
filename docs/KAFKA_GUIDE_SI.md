@@ -1,18 +1,6 @@
 
----
 
-## Kafka topics
 
-| Topic | Partitions | Retention | Contents |
-| --- | --- | --- | --- |
-| `transactions.raw` | 6 | 7 days | Incoming transactions, keyed by sender account |
-| `transactions.scored` | 6 | 7 days | Every transaction with its fraud probability and label |
-| `fraud.alerts` | 3 | 30 days | Transactions flagged as fraud |
-| `transactions.dlq` | 3 | 14 days | Messages that could not be processed, with error details |
-
-All topics use replication factor 3 and `min.insync.replicas=2` (see `scripts/create_topics.sh`).
-
----
 
 ## Verified run
 
