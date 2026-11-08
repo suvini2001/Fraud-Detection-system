@@ -7,7 +7,7 @@ Kafka features shown here
     -> hash(key) % partitions decides the partition, so every transaction of
        one account lands on the SAME partition, in ORDER. Different accounts
        spread across all partitions -> parallel processing.
-* acks=all + idempotence (see common/kafka_clients.py) -> no loss, no duplicates.
+* acks=all + idempot ence (see common/kafka_clients.py) -> no loss, no duplicates.
 * Asynchronous send with a delivery callback (no flush() after every message,
   which the old code did and which kills throughput).
 * Headers with schema version / content type / trace id.
