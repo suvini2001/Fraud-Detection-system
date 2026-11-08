@@ -59,6 +59,9 @@ def producer_config(kafka: KafkaSettings, transactional_id: Optional[str] = None
         # Enables Kafka transactions (exactly-once read-process-write).
         conf["transactional.id"] = transactional_id
         conf["transaction.timeout.ms"] = 60000
+        # librdkafka rule: message.timeout.ms (= delivery.timeout.ms) must be
+        # <= transaction.timeout.ms, otherwise the producer refuses to start.
+        conf["delivery.timeout.ms"] = 60000
     return conf
 
 

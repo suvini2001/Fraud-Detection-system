@@ -120,3 +120,22 @@ def test_at_least_once_does_not_commit_if_outputs_not_delivered():
     with pytest.raises(RuntimeError):
         svc.poll_once()
     assert consumer.commits == []
+
+
+def test_init_transactions_is_retried_after_timeout():
+    class SlowInitProducer(FakeProducer):
+        def __init__(self):
+            super().__init__()
+            self.init_calls = 0
+
+        def init_transactions(self, timeout=None):
+            self.init_calls += 1
+            if self.init_calls < 3:
+                raise KafkaException(KafkaError(KafkaError._TIMED_OUT, "Timed out", retriable=True))
+            super().init_transactions(timeout)
+
+    producer = SlowInitProducer()
+    svc = FraudScoringService(KafkaSettings(), ScorerSettings(), FakeScorer(), FakeConsumer(), producer)
+    svc.start()
+    assert producer.init_calls == 3
+    assert producer.txn_log == ["init"]

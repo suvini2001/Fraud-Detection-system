@@ -1,0 +1,333 @@
+# Real-Time Fraud Detection Pipeline
+
+An event-driven fraud-detection system. An XGBoost model scores payment transactions as they stream through a fault-tolerant **Apache Kafka** cluster. Suspected fraud is routed to an alerts topic, and bad messages are isolated in a dead-letter queue. A **FastAPI** gateway lets you score a single transaction or publish one into the stream.
+
+The whole stack runs locally with one `docker compose up`, and every result in the [Verified run](#verified-run) section comes from running it.
+
+> **Status:** ongoing personal project. The Kafka streaming phase is complete and verified end to end; planned next steps are in the [Roadmap](#roadmap).
+
+---
+
+## Architecture
+
+```mermaid
+flowchart LR
+    P[Producer<br/>simulated payment gateway] -->|key = sender account| RAW[(transactions.raw<br/>6 partitions, RF=3)]
+    API[FastAPI<br/>POST /v1/transactions] -->|acks=all| RAW
+    RAW --> S[Scorer x3<br/>group: fraud-scorer<br/>XGBoost]
+    S -->|every result| SC[(transactions.scored)]
+    S -->|fraud only| AL[(fraud.alerts)]
+    S -->|poison messages| DLQ[(transactions.dlq)]
+    AL --> N[Alert notifier<br/>group: fraud-alert-notifier]
+    N --> F["data/alerts.jsonl"]
+    API2[FastAPI<br/>POST /predict] -.->|direct scoring| M[XGBoost model]
+```
+
+All four Python services (`api`, `producer`, `scorer`, `alerts`) are built from **one Docker image** and share code in `app/common/`.
+
+---
+
+## Key features
+
+### Reliable Kafka cluster
+- **3-broker cluster in KRaft mode** (no ZooKeeper). Each node is both broker and controller.
+- **Replication factor 3, `min.insync.replicas=2`**, and unclean leader election disabled, so a broker can fail without losing acknowledged messages.
+- **Idempotent producer with `acks=all`**, so retries never create duplicates.
+- Topics are created explicitly with fixed partitions and retention, with retries if a broker is slow at startup. Auto-creation is turned off.
+
+### Ordering and scaling
+- Messages are **keyed by sender account** (`nameOrig`, murmur2 partitioner), so each account's transactions stay in order on one partition.
+- **6 partitions** let the scorer consumer group scale horizontally (`--scale scorer=6`), using **cooperative-sticky rebalancing** so only the partitions that move are paused.
+- A **separate alert consumer group** reads `fraud.alerts` independently (publish/subscribe).
+
+### Processing guarantees
+- **Exactly-once scoring with Kafka transactions.** Output messages and input offsets are committed together (`send_offsets_to_transaction`), and downstream consumers use `read_committed`. If a batch fails, the transaction is aborted and the batch is re-read.
+- An **at-least-once mode** is available as a fallback (`PROCESSING_GUARANTEE=at_least_once`).
+- The alert notifier is at-least-once and **de-duplicates by `transaction_id`** (idempotent consumer).
+- **Dead-letter queue.** Invalid JSON or schema violations go to `transactions.dlq` with the error and the source partition and offset, instead of blocking the partition.
+
+### Data contracts and serving
+- **Versioned Pydantic schemas** (`schema_version`) with field validation, plus Kafka headers carrying schema version, content type and producer name.
+- **Shared feature engineering**: log amount, balance deltas, time of day, sender/receiver frequency maps, merchant flag, and one-hot transaction type.
+- **Fixed a training–serving skew bug.** The old code used `pd.get_dummies(..., drop_first=True)` on a single row, which dropped the transaction type entirely. The fix and its regression test are in `features.py` and `tests/test_features_serde.py`.
+
+---
+
+## Kafka topics
+
+| Topic | Partitions | Retention | Contents |
+| --- | --- | --- | --- |
+| `transactions.raw` | 6 | 7 days | Incoming transactions, keyed by sender account |
+| `transactions.scored` | 6 | 7 days | Every transaction with its fraud probability and label |
+| `fraud.alerts` | 3 | 30 days | Transactions flagged as fraud |
+| `transactions.dlq` | 3 | 14 days | Messages that could not be processed, with error details |
+
+All topics use replication factor 3 and `min.insync.replicas=2` (see `scripts/create_topics.sh`).
+
+---
+
+## Verified run
+
+Results from running the full stack locally (Docker Desktop on Windows, 3 brokers, 3 scorers).
+
+### Healthy cluster
+
+All 3 brokers online; all 68 partitions online with **204 of 204 replicas in sync** and no under-replicated partitions.
+
+![Kafka UI: 3 brokers, 204 of 204 in-sync replicas](docs/images/kafka-ui-brokers.png)
+
+### Scoring with exactly-once batches
+
+The 3 scorers split the 6 partitions (2 each) and committed their first batches with no aborted transactions and no dead letters:
+
+```
+scorer-1  REBALANCE +assigned transactions.raw[0], transactions.raw[3]
+scorer-2  REBALANCE +assigned transactions.raw[2], transactions.raw[5]
+scorer-3  REBALANCE +assigned transactions.raw[1], transactions.raw[4]
+
+scorer-1  stats {'processed': 200, 'fraud': 17, 'dlq': 0, 'batches': 1, 'aborted': 0}
+scorer-2  stats {'processed': 200, 'fraud': 14, 'dlq': 0, 'batches': 1, 'aborted': 0}
+scorer-3  stats {'processed': 200, 'fraud': 29, 'dlq': 0, 'batches': 1, 'aborted': 0}
+```
+
+60 of the first 600 transactions (10%) were flagged, matching the producer's configured fraud ratio (`PRODUCER_FRAUD_RATIO=0.10`). Each alert logs its source, for example `FRAUD ALERT ... account=C852717984 amount=444668.44 p=1.000 (p2@27)` = partition 2, offset 27.
+
+### Per-account ordering
+
+Every transaction from the same account landed on the same partition, in offset order:
+
+| Account | Partition | Offsets |
+| --- | --- | --- |
+| `C916327431` | 2 | 65, 83, 180 |
+| `C102494739` | 4 | 69, 102, 166 |
+| `C686572494` | 4 | 94, 163, 214 |
+
+Publishing three transactions for one account through the API (`./scripts/demo.sh api`) returned **202 Accepted** with the same partition each time. Offset 1895 belongs to a producer message on the same partition in between:
+
+![Three API calls for account C123456789 all land on partition 2](docs/images/demo-api-same-partition.png)
+
+### Broker failure
+
+With `kafka-2` stopped (`./scripts/demo.sh broker-down`), the producer kept delivering with **zero failed messages**: 2,185 to 2,234 delivered within 10 seconds.
+
+![Producer keeps delivering with failed=0 while kafka-2 is down](docs/images/demo-broker-down-producer.png)
+
+While `kafka-2` was down, leadership moved to brokers 1 and 3 and each partition's in-sync set shrank to 2, which still meets `min.insync.replicas=2`:
+
+```
+Partition: 0  Leader: 3  Replicas: 3,1,2  Isr: 3,1
+Partition: 1  Leader: 1  Replicas: 1,2,3  Isr: 1,3
+Partition: 2  Leader: 3  Replicas: 2,3,1  Isr: 3,1
+Partition: 3  Leader: 1  Replicas: 2,1,3  Isr: 1,3
+Partition: 4  Leader: 1  Replicas: 1,3,2  Isr: 1,3
+Partition: 5  Leader: 3  Replicas: 3,2,1  Isr: 3,1
+```
+
+After `./scripts/demo.sh broker-up`, `kafka-2` caught up and rejoined the ISR: all **354 of 354** replicas are back in sync with no under-replicated partitions. It holds no leaderships yet; Kafka's automatic preferred-leader rebalance (`auto.leader.rebalance.enable`, checked every 5 minutes by default) moves leaders back to it, while brokers 1 and 3 keep serving in the meantime.
+
+![After recovery: 354 of 354 in sync, kafka-2 back but leading 0 partitions](docs/images/kafka-ui-brokers-after-recovery.png)
+
+The count grew from 68 to 118 partitions because the first transactional producer created the internal `__transaction_state` topic (50 partitions); 118 x 3 replicas = 354.
+
+### End state
+
+After the demos, **13,762 transactions** had flowed through `transactions.raw`, every topic was fully replicated (0 out-of-sync replicas), and both consumer groups were **STABLE** and caught up (lag 3 each), with 3 scorer members.
+
+![Topics: 13,762 raw transactions, 0 out-of-sync replicas](docs/images/kafka-ui-topics.png)
+
+![Consumer groups: fraud-scorer with 3 members, both STABLE, lag 3](docs/images/kafka-ui-consumers.png)
+
+> **Reading the counts:** Kafka UI's "Number of messages" is the offset range. Topics written inside transactions (`transactions.scored`, `fraud.alerts`, `transactions.dlq`) also store a commit marker per partition per transaction, and each marker takes an offset. That is why `transactions.scored` (14,437) shows more offsets than `transactions.raw` (13,762), which is written without transactions. `read_committed` consumers never see the markers.
+
+### Dead-letter queue
+
+An invalid message (`./scripts/demo.sh dlq`) was routed to `transactions.dlq` with the validation errors, its source topic, partition and offset, and the consumer group that rejected it. The partition kept flowing:
+
+![Dead letter with error details and source coordinates](docs/images/demo-dlq.png)
+
+---
+
+## Quick start
+
+### Prerequisites
+- **Docker Desktop**, running, with at least **6 GB of memory** assigned (Settings → Resources). The 3 brokers use about 400 MB each; the whole stack used about 2.3 GB in testing.
+- **Git Bash or WSL** on Windows to run the `scripts/*.sh` helpers.
+- The trained model artifacts in `app/model/` (not committed to Git, see note below):
+  - `fraud_xgb_model.pkl`
+  - `model_features.pkl`
+  - `frequency_maps.pkl`
+
+> **Note:** model files are git-ignored to keep the repository small. Moving them to a model registry (MLflow) is on the [Roadmap](#roadmap).
+
+### Run
+
+```bash
+docker compose up -d --build
+docker compose ps -a
+```
+
+Expected: `kafka-1`, `kafka-2` and `kafka-3` are `Up (healthy)`, `kafka-init` is `Exited (0)` (topics created), and `api`, `producer`, `scorer` x3 and `alerts` are `Up`. On a laptop, the scorers can take a minute or two to load the model and initialise their transactions.
+
+| Service | URL |
+| --- | --- |
+| FastAPI docs (Swagger) | http://localhost:8000/docs |
+| Kafka UI | http://localhost:8080 |
+
+Check that scoring is running:
+
+```bash
+docker compose logs -f scorer
+```
+
+Look for `Subscribed to 'transactions.raw' as group 'fraud-scorer' (exactly_once)`, `REBALANCE +assigned`, `FRAUD ALERT` and `stats {...}` lines.
+
+Stop everything with `docker compose down` (add `-v` to delete Kafka data).
+
+---
+
+## API
+
+### `POST /predict`: score one transaction directly
+
+```bash
+curl -X POST http://localhost:8000/predict \
+  -H "Content-Type: application/json" \
+  -d '{
+        "step": 10, "type": "TRANSFER", "amount": 181000,
+        "nameOrig": "C1305486145", "oldbalanceOrg": 181000, "newbalanceOrig": 0,
+        "nameDest": "C553264065", "oldbalanceDest": 0, "newbalanceDest": 0
+      }'
+```
+
+Returns `transaction_id`, `fraud_probability` and `is_fraud`.
+
+### `POST /v1/transactions`: publish into the Kafka stream
+
+The same request body returns **202 Accepted** once the in-sync replicas have acknowledged the message. The response includes the topic, key, partition and offset. The transaction is then scored by the consumer group.
+
+| Error | Meaning |
+| --- | --- |
+| 422 | Request body failed schema validation |
+| 503 | Producer unavailable or its queue is full |
+| 504 | Timed out waiting for the Kafka acknowledgement |
+| 502 | Kafka delivery failed |
+
+### `GET /health`
+Reports whether Kafka is reachable and how many brokers are visible.
+
+---
+
+## Demo script
+
+`scripts/demo.sh` walks through the Kafka features step by step:
+
+```bash
+./scripts/demo.sh topics        # partitions, leaders, replicas, ISR
+./scripts/demo.sh groups        # which scorer owns which partition, and lag
+./scripts/demo.sh scale 6       # add consumers and watch the rebalance
+./scripts/demo.sh broker-down   # stop one broker; writes keep working
+./scripts/demo.sh broker-up     # broker rejoins and catches up
+./scripts/demo.sh dlq           # send a poison message and see it in the DLQ
+./scripts/demo.sh api           # publish through the API; same account -> same partition
+./scripts/demo.sh lag           # consumer lag (needs `watch`, not in Git Bash; use `groups`)
+```
+
+---
+
+## Configuration
+
+Every service reads the same environment variables (`app/common/config.py`), so the system can be configured from Docker Compose or Kubernetes without code changes. The main ones:
+
+| Variable | Default | Purpose |
+| --- | --- | --- |
+| `KAFKA_BOOTSTRAP_SERVERS` | `kafka-1:29092,kafka-2:29092,kafka-3:29092` | Brokers to connect to |
+| `PROCESSING_GUARANTEE` | `exactly_once` | `exactly_once` or `at_least_once` |
+| `FRAUD_THRESHOLD` | `0.5` | Probability above which a transaction is flagged |
+| `SCORER_BATCH_SIZE` | `200` | Messages per scoring batch |
+| `MODEL_VERSION` | `xgb-v1` | Version tag added to scored messages |
+| `PRODUCER_TPS` | `5` | Simulated transactions per second |
+| `PRODUCER_FRAUD_RATIO` | `0.10` | Share of simulated transactions that look fraudulent |
+| `PRODUCER_NUM_CUSTOMERS` | `500` | Size of the simulated customer pool |
+| `GROUP_INSTANCE_ID` | *(empty)* | Optional static membership to avoid rebalances on restart |
+
+---
+
+## Tests
+
+```bash
+pip install -r requirements-dev.txt
+pytest
+```
+
+20 unit tests cover:
+- the transactional commit path, abort and batch rewind, fatal errors, and retrying `init_transactions` after a timeout;
+- at-least-once commit ordering;
+- dead-letter contents, serialization and schema validation;
+- feature engineering, including the one-hot regression test;
+- **real** confluent-kafka producer and consumer construction from our configs, so an invalid setting combination fails in CI instead of in the containers.
+
+Kafka is replaced with fakes (`tests/fakes.py`) for the service tests, so no broker is needed. One test that loads the real model is skipped if the model files are missing.
+
+---
+
+## Debugging notes
+
+All unit tests passed, but the first full Docker run exposed three startup problems that fakes could not catch. Each fix has a regression test.
+
+| Symptom | Root cause | Fix |
+| --- | --- | --- |
+| Scorers crash-looped; `fraud-scorer` group never appeared and `transactions.scored` stayed empty | librdkafka requires `delivery.timeout.ms` (`message.timeout.ms`) ≤ `transaction.timeout.ms`; the shared producer config had 120 s vs 60 s, so the **transactional** producer refused to start. The API and producer are not transactional, so they worked | Transactional producers use a 60 s delivery timeout. `tests/test_kafka_config.py` now builds real clients from the configs |
+| `init_transactions()` timed out on the first run (`_TIMED_OUT`, then `NOT_COORDINATOR`) | The first transactional producer on a new cluster triggers creation of `__transaction_state` (50 partitions x RF 3); on a busy laptop that outlasted a single 30 s call, and librdkafka reports it as retriable | Retry `init_transactions()` (up to 10 x 60 s) on retriable errors; fatal errors such as fencing still crash |
+| `kafka-init` failed with `TimeoutException ... node 1 being disconnected` | A broker was slow to answer while all app containers were starting at once | `create_topics.sh` retries each topic up to 5 times (safe with `--if-not-exists`) |
+
+Environment lessons:
+- Running another local Kubernetes cluster (k3d) at the same time starved the brokers of memory, so they never became healthy. Stop other heavy stacks first.
+- On Windows, shell scripts checked out with CRLF line endings fail inside Linux containers; `.gitattributes` forces `*.sh` to LF.
+
+---
+
+## Project structure
+
+```
+app/
+├── api.py               # FastAPI: /predict, /v1/transactions, /health
+├── producer.py          # simulated payment gateway
+├── consumer.py          # scoring consumer group (exactly-once, DLQ)
+├── alert_consumer.py    # alert notifier (idempotent, at-least-once)
+└── common/
+    ├── config.py        # environment-based settings
+    ├── features.py      # feature engineering shared by API and scorer
+    ├── kafka_clients.py # producer/consumer configuration
+    ├── model.py         # XGBoost model loading and scoring
+    ├── schemas.py       # versioned Pydantic message contracts
+    ├── serde.py         # serialization and Kafka headers
+    └── logging_setup.py
+scripts/
+├── create_topics.sh     # topic creation (partitions, RF, retention, retries)
+└── demo.sh              # step-by-step feature demo
+tests/                   # unit tests (Kafka fakes + real client config checks)
+docs/images/             # screenshots from the verified run
+docker-compose.yml       # 3-broker KRaft cluster + Kafka UI + app services
+Dockerfile               # one non-root image for all services
+```
+
+---
+
+## Roadmap
+
+Planned extensions, not yet implemented:
+
+- [ ] **Online feature store.** Feast with Redis for streaming per-account velocity features (for example, transaction count and amount over the last hour).
+- [ ] **Model registry.** MLflow for versioned models, replacing the git-ignored `.pkl` files, and re-saving the model in XGBoost's native JSON format (the current pickle triggers a version-compatibility warning).
+- [ ] **Kubernetes deployment.** Run Kafka with the Strimzi operator and the services as Deployments, with stable consumer identities for static membership.
+- [ ] **Monitoring.** Prometheus and Grafana for throughput, consumer lag and latency, and Evidently for data and prediction drift.
+
+---
+
+## Tech stack
+
+Python 3.11 · Apache Kafka 3.6 (Confluent Platform 7.6, KRaft) · confluent-kafka · XGBoost · pandas · FastAPI · Pydantic v2 · Docker Compose · pytest
+
+## Author
+
+**Suvini Fonseka**, Computer Engineering, University of Peradeniya · [GitHub](https://github.com/suvini2001) · [LinkedIn](https://www.linkedin.com/in/suvinirfonseka)

@@ -42,6 +42,7 @@ x-kafka-env:
   KAFKA_AUTO_CREATE_TOPICS_ENABLE: "false"
   KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: 3000
   KAFKA_LOG_DIRS: "/var/lib/kafka/data"
+  KAFKA_HEAP_OPTS: "-Xms256m -Xmx512m"
 
 services:
   kafka-1:

@@ -79,7 +79,7 @@ class FraudScoringService:
         if self.exactly_once:
             # Registers transactional.id with the transaction coordinator and
             # FENCES any zombie instance using the same id.
-            self.producer.init_transactions(30)
+            self._init_transactions_with_retry()
         self.consumer.subscribe(
             [self.topics.raw],
             on_assign=self.on_assign,
@@ -88,6 +88,24 @@ class FraudScoringService:
         )
         log.info("Subscribed to '%s' as group '%s' (%s)",
                  self.topics.raw, self.settings.group_id, self.settings.processing_guarantee)
+
+    def _init_transactions_with_retry(self, attempts: int = 10, timeout_s: float = 60) -> None:
+        """The first init_transactions() on a fresh cluster also creates the
+        internal __transaction_state topic (50 partitions x RF 3), which can
+        take longer than one call allows on a busy machine. librdkafka reports
+        that as a retriable timeout ("retry call to resume"), so retry."""
+        for attempt in range(1, attempts + 1):
+            try:
+                self.producer.init_transactions(timeout_s)
+                return
+            except KafkaException as exc:
+                err = exc.args[0]
+                retriable = err.retriable() or err.code() == KafkaError._TIMED_OUT
+                if retriable and attempt < attempts:
+                    log.warning("init_transactions not done yet (attempt %d/%d), retrying: %s",
+                                attempt, attempts, err)
+                    continue
+                raise
 
     def poll_once(self) -> int:
         msgs = self.consumer.consume(
