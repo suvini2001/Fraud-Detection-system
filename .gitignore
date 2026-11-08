@@ -167,3 +167,5 @@ data/processed/
 # Nested / Cloned Repositories (not submodules)
 # ------------------------------------------------------------
 Fraud-Detection system/
+
+data/
