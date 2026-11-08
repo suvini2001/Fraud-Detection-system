@@ -220,13 +220,3 @@ pytest
 
 Kafka is replaced with fakes (`tests/fakes.py`) for the service tests, so no broker is needed. One test that loads the real model is skipped if the model files are missing.
 
----
-
-
-## Tech stack
-
-Python 3.11 · Apache Kafka 3.6 (Confluent Platform 7.6, KRaft) · confluent-kafka · XGBoost · pandas · FastAPI · Pydantic v2 · Docker Compose · pytest
-
-## Author
-
-**Suvini Fonseka**, Computer Engineering, University of Peradeniya · [GitHub](https://github.com/suvini2001) · [LinkedIn](https://www.linkedin.com/in/suvinirfonseka)
