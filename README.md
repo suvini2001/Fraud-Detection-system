@@ -70,6 +70,22 @@ All topics use replication factor 3 and `min.insync.replicas=2` (see `scripts/cr
 
 Results from running the full stack locally (Docker Desktop on Windows, 3 brokers, 3 scorers).
 
+### Results summary
+
+| # | Result | Evidence | Why it holds |
+| --- | --- | --- | --- |
+| 1 | **Every partition is fully replicated** | Kafka UI: 3 brokers, 204/204 in-sync replicas, later 354/354; 0 under-replicated, 0 out-of-sync | All topics, including the internal `__consumer_offsets` and `__transaction_state`, use replication factor 3, so each partition has a copy on every broker |
+| 2 | **Load is spread evenly across brokers** | Leaders per broker: 23 / 23 / 22 out of 68 partitions | Kafka assigns partition leadership round-robin, so no single broker handles all reads and writes |
+| 3 | **Scoring scales horizontally** | `fraud-scorer` group: 3 members; logs show partitions 2 per scorer | One partition goes to one member of a group, so 6 partitions let up to 6 scorers work in parallel |
+| 4 | **Scorers keep up with the stream** | 13,762 transactions in `transactions.raw`; `fraud-scorer` lag 3 | Lag (messages not yet processed) stays near zero, so batches of 200 are scored faster than the producer sends |
+| 5 | **Exactly-once commits are active** | Scorer stats `aborted: 0`; `__transaction_state` topic created; `transactions.scored` shows more offsets (14,437) than `raw` (13,762) | Each batch commits outputs and offsets in one transaction; the extra offsets are the transaction commit markers |
+| 6 | **No data loss when a broker fails** | Producer `failed=0` while `kafka-2` was down (2,185 → 2,234 delivered); ISR 2 per partition | With RF 3 and `min.insync.replicas=2`, writes with `acks=all` still succeed with 2 brokers, and leaders move to the survivors |
+| 7 | **Automatic recovery** | After restart: 354/354 in sync, 0 under-replicated | The returning broker copies what it missed from the leaders and rejoins the ISR with no manual work |
+| 8 | **Per-account ordering** | Same account → same partition, increasing offsets (API demo and scorer logs) | Messages are keyed by sender account; murmur2 hashing maps a key to one partition, and Kafka orders each partition |
+| 9 | **Bad messages don't block the stream** | DLQ record with error, source partition and offset; scoring continued | Invalid messages are routed to `transactions.dlq` instead of being retried forever on their partition |
+| 10 | **Independent consumers (publish/subscribe)** | `fraud-alert-notifier` group: separate, STABLE, lag 3 | A different `group.id` gets its own copy of `fraud.alerts` with its own offsets, without affecting the scorers |
+| 11 | **Detection matches the injected fraud rate** | 60 of the first 600 transactions flagged (10%) | The simulated producer makes 10% of transactions fraud-like (`PRODUCER_FRAUD_RATIO=0.10`) |
+
 ### Healthy cluster
 
 All 3 brokers online; all 68 partitions online with **204 of 204 replicas in sync** and no under-replicated partitions.
