@@ -146,7 +146,31 @@ services:
       kafka-init: { condition: service_completed_successfully }
     restart: unless-stopped
 
+  mlflow:
+    build:
+      context: ./mlflow
+    ports:
+      - "127.0.0.1:5000:5000"
+    volumes:
+      - mlflow_data:/mlflow/data
+    command:
+      - mlflow
+      - server
+      - --host
+      - "0.0.0.0"
+      - --port
+      - "5000"
+      - --backend-store-uri
+      - sqlite:////mlflow/data/mlflow.db
+      - --serve-artifacts
+      - --artifacts-destination
+      - /mlflow/data/artifacts
+      - --allowed-hosts
+      - "localhost:5000,127.0.0.1:5000,mlflow:5000"
+    restart: unless-stopped
+
 volumes:
   kafka1-data:
   kafka2-data:
   kafka3-data:
+  mlflow_data:
